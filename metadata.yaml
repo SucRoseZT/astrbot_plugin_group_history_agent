@@ -53,6 +53,9 @@ desc: |
   /申请 [群/好友] 看待处理申请、/工具自检 逐个排查十三个工具的注册状态。
 version: 2.6.0
 author: SucRoseZT
+repo: https://github.com/SucRoseZT/astrbot_plugin_group_history_agent
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.5.1"
+tags:
+  - astrbot

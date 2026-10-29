@@ -1,0 +1,336 @@
+{
+  "requests": {
+    "description": "📥 申请处理",
+    "type": "object",
+    "hint": "别人的加群申请、好友申请：机器人收到时把 flag 攒起来，AI 再决定同意还是拒绝。也能主动发好友申请（但那个接口不是每个协议端都有）。",
+    "items": {
+      "requests_enabled": {
+        "description": "收集并处理申请",
+        "type": "bool",
+        "hint": "关掉后不再攒待处理申请，也没法用 handle_request 同意/拒绝。",
+        "default": true
+      },
+      "requests_ttl_hours": {
+        "description": "待处理保留几小时",
+        "type": "int",
+        "hint": "超过这个时间的申请自动丢弃。QQ 的 flag 本身也有有效期，太久的就算列表里有也处理不了。",
+        "default": 24
+      },
+      "requests_max": {
+        "description": "最多攒几条",
+        "type": "int",
+        "hint": "防止攒太多占内存。超了丢最旧的。",
+        "default": 50
+      },
+      "allow_send_friend_request": {
+        "description": "允许主动加好友",
+        "type": "bool",
+        "hint": "主动向某个 QQ 发好友申请。不在 OneBot 标准里，NapCat 较新版本才支持，不支持会明确报错。",
+        "default": true
+      },
+      "owner_only": {
+        "description": "仅主人可用申请功能",
+        "type": "bool",
+        "hint": "开 = 只有主人（admins_id 里的 QQ）能让 AI 查看待处理申请 / 同意 / 拒绝，其他人问一律权限拒绝。关 = 任何人都能让 AI 处理申请——注意这意味着别人可以让 AI 同意「他自己发的好友申请」，想清楚再关。",
+        "default": true
+      }
+    }
+  },
+  "relay": {
+    "description": "📨 跨会话转述",
+    "type": "object",
+    "hint": "AI 把话带给其他 QQ 用户或群（原 astrbot_plugin_xrelay 功能）。防刷屏三件套：内容去重、目标冷却、废消息拦截。发送仍走 context.send_message，记忆插件的「转述起因」照常记录。",
+    "items": {
+      "allow_members": {
+        "description": "允许普通成员使用转述",
+        "type": "bool",
+        "hint": "关 = 只有主人能用跨会话转述；开 = 群里普通人也能让 AI 带话。放开后防刷屏三件套（目标冷却 / 内容去重 / 废消息拦截）对所有人同样生效，且冷却按「来源会话+目标」分开算。",
+        "default": false
+      },
+      "allow_segments": {
+        "description": "允许分段连发",
+        "type": "bool",
+        "hint": "AI 一次调用里把多段话连着发出去，像真人在连发。分段算一次调用，冷却只消耗一次。",
+        "default": true
+      },
+      "max_segments": {
+        "description": "单次最多几段",
+        "type": "int",
+        "hint": "分段模式一次最多发几段，超过会被截断。代码硬顶 10，防止刷屏。",
+        "default": 5
+      },
+      "segment_delay_ms": {
+        "description": "分段间隔（毫秒）",
+        "type": "int",
+        "hint": "连发时每段之间隔多久。太短像轰炸，太长像卡了。900ms 比较自然。",
+        "default": 900
+      },
+      "target_cooldown_seconds": {
+        "description": "同一目标冷却（秒）",
+        "type": "int",
+        "hint": "从同一个会话往同一个目标转述，多少秒内只允许成功一次。0 = 关闭冷却（不推荐，AI 可能反复发送）。",
+        "default": 120
+      },
+      "dedup_window_seconds": {
+        "description": "相同内容去重窗口（秒）",
+        "type": "int",
+        "hint": "完全相同的内容（含分段拼接）在这个窗口内只发一次，换措辞才放行。0 = 关闭去重。",
+        "default": 600
+      }
+    }
+  },
+  "read": {
+    "description": "📖 读取设置",
+    "type": "object",
+    "hint": "AI 读聊天记录时的默认条数、上限和单条长度。这里的值只影响读取，不影响搜人和资料。",
+    "items": {
+      "default_count": {
+        "description": "默认读取条数",
+        "type": "int",
+        "hint": "AI 没指定条数时读多少条消息。20 条大约是一屏群聊的量。",
+        "default": 20
+      },
+      "max_count": {
+        "description": "单次读取上限",
+        "type": "int",
+        "hint": "AI 最多能一次要多少条。调太大容易把上下文撑爆，100 已经够用。",
+        "default": 100
+      },
+      "max_content_length": {
+        "description": "单条消息截断长度",
+        "type": "int",
+        "hint": "一条消息最多保留多少字符，超出截断。群里有人发长文时防止一条吃掉整段预算。",
+        "default": 200
+      },
+      "enable_fallback": {
+        "description": "协议端失败时回退会话历史",
+        "type": "bool",
+        "hint": "协议端不支持 get_group_msg_history 时，改读 AstrBot 自己的会话历史。注意这部分只含和机器人的对话，不是完整群聊。",
+        "default": true
+      }
+    }
+  },
+  "cache": {
+    "description": "💾 消息缓存",
+    "type": "object",
+    "hint": "把机器人亲眼看到的消息存进内存。协议端的历史接口经常缺机器人自己刚发的消息，只查 API 会漏掉最新几条；两路合并去重才是完整现场。",
+    "items": {
+      "cache_enabled": {
+        "description": "启用消息缓存",
+        "type": "bool",
+        "hint": "关掉之后只用协议端 API，机器人自己刚说的话可能查不到。",
+        "default": true
+      },
+      "cache_bot_messages": {
+        "description": "缓存机器人自己发的消息",
+        "type": "bool",
+        "hint": "很多协议端的历史里不含 bot 消息，导致 AI 复盘时看不到自己说过什么。开着更完整。",
+        "default": true
+      },
+      "cache_size": {
+        "description": "每个会话缓存上限",
+        "type": "int",
+        "hint": "一个群/好友最多留多少条。按条数算，500 条约占几 MB 内存。",
+        "default": 300
+      },
+      "cache_inactive_timeout": {
+        "description": "冷会话清理时间（秒）",
+        "type": "int",
+        "hint": "多久没新消息就把这个会话的缓存扔掉。0 或负数 = 不自动清理（群多的话内存会一直涨）。",
+        "default": 3600
+      },
+      "api_history_count": {
+        "description": "向协议端多要几条",
+        "type": "int",
+        "hint": "除了要的条数，额外多拉这么多条用于合并去重。协议端可能返回重复消息，多拿一点才不会合并完反而不够数。",
+        "default": 30
+      }
+    }
+  },
+  "search": {
+    "description": "🔍 搜索与筛选",
+    "type": "object",
+    "hint": "按人检索发言时往回翻多少、最多返回多少。搜人（按昵称找 QQ）不受这里的限制，它直接查群成员列表。",
+    "items": {
+      "search_scan_limit": {
+        "description": "按人检索扫描上限",
+        "type": "int",
+        "hint": "为了找某个人的发言，最多往回翻多少条历史。调大能找到更早的，但协议端会变慢。",
+        "default": 200
+      },
+      "search_max_hits": {
+        "description": "按人检索返回上限",
+        "type": "int",
+        "hint": "找到的该成员消息最多返回几条。",
+        "default": 20
+      },
+      "friend_scan_limit": {
+        "description": "私聊记录扫描上限",
+        "type": "int",
+        "hint": "查与某好友的私聊时，最多往回翻多少条。",
+        "default": 200
+      },
+      "show_message_id": {
+        "description": "结果里带消息 ID",
+        "type": "bool",
+        "hint": "每条消息后面附 (ID: xxx)。要让 AI 引用或撤回某条消息时必须带；只是聊天总结可以关掉省点 token。",
+        "default": true
+      }
+    }
+  },
+  "profile": {
+    "description": "👤 用户资料",
+    "type": "object",
+    "hint": "搜人和看资料时输出哪些字段。群主/管理员身份默认总会显示，因为那关系到说话分量。",
+    "items": {
+      "profile_enabled": {
+        "description": "启用搜人与资料工具",
+        "type": "bool",
+        "hint": "关掉之后 AI 就没有 search_qq_user / get_user_profile 这两个工具了，/搜人 /资料 指令也不响应。",
+        "default": true
+      },
+      "show_avatar": {
+        "description": "显示头像",
+        "type": "bool",
+        "hint": "资料里带头像地址。关掉就完全不提头像。",
+        "default": true
+      },
+      "avatar_as_image": {
+        "description": "头像发成图片",
+        "type": "bool",
+        "hint": "开着时查资料会直接发一张头像图片，比给链接直观；关掉只在文本里给地址，AI 自己决定要不要提。",
+        "default": true
+      },
+      "show_nickname": {
+        "description": "显示昵称",
+        "type": "bool",
+        "hint": "QQ 昵称（不是群名片）。关掉只显示群名片。",
+        "default": true
+      },
+      "show_qq": {
+        "description": "显示 QQ 号",
+        "type": "bool",
+        "hint": "关掉就不暴露 QQ 号，只给昵称/群名片。有些场景不想让 AI 记住号码就关掉。",
+        "default": true
+      },
+      "show_card": {
+        "description": "显示群名片",
+        "type": "bool",
+        "hint": "群里的马甲。和昵称不同时会一起显示（「群名片（原名）」）。",
+        "default": true
+      },
+      "show_level": {
+        "description": "显示等级与头衔",
+        "type": "bool",
+        "hint": "QQ 等级、群头衔、龙王这些。纯装饰信息，嫌啰嗦可以关。",
+        "default": true
+      },
+      "show_detail": {
+        "description": "显示性别年龄地区",
+        "type": "bool",
+        "hint": "协议端返回的详细资料。这些字段常不准（很多人乱填），默认开着但只作参考。",
+        "default": true
+      },
+      "show_qzone_detail": {
+        "description": "查空间深度资料",
+        "type": "bool",
+        "hint": "生日、公司、职业、省市、学校这些协议端不直接给，要借 QQ 空间的登录态去查。拿不到就自动跳过，不影响其它字段。",
+        "default": true
+      },
+      "show_background": {
+        "description": "显示资料卡背景图",
+        "type": "bool",
+        "hint": "背景图能不能拿到取决于协议端和账号登录态；拿不到时不会报错，只是这一项不显示。",
+        "default": true
+      }
+    }
+  },
+  "interact": {
+    "description": "👋 互动",
+    "type": "object",
+    "hint": "戳一戳和点赞。都要协议端支持，且受 QQ 自身频率限制（点赞每人每天约 10 次，全天上限几十次）。",
+    "items": {
+      "interact_enabled": {
+        "description": "启用互动工具",
+        "type": "bool",
+        "hint": "关掉之后 AI 就没有 poke_user / like_user 两个工具，/戳 /点赞 指令也不响应。",
+        "default": true
+      },
+      "poke_enabled": {
+        "description": "允许戳一戳",
+        "type": "bool",
+        "hint": "双击头像那个效果。群聊里要用群戳，私聊用好友戳，插件会自己判断。",
+        "default": true
+      },
+      "like_enabled": {
+        "description": "允许点赞",
+        "type": "bool",
+        "hint": "给对方资料卡点赞（不是说说点赞）。QQ 限制每人每天约 10 次，超出协议端会返回失败。",
+        "default": true
+      },
+      "like_times": {
+        "description": "默认点赞次数",
+        "type": "int",
+        "hint": "AI 没指定次数时点几下，最大 10。一次点满省调用。",
+        "default": 10
+      },
+      "recall_enabled": {
+        "description": "允许撤回自己的消息",
+        "type": "bool",
+        "hint": "让 AI 能撤掉自己刚发的话。只能撤自己的，撤不了别人的。",
+        "default": true
+      },
+      "recall_max_count": {
+        "description": "单次最多撤几条",
+        "type": "int",
+        "hint": "长回复被分成多段发送时，撤 1 条只撤最后一段。给 AI 留点余地，默认 5，代码硬顶 10。",
+        "default": 5
+      },
+      "recall_window_seconds": {
+        "description": "只撤这么久以内的",
+        "type": "int",
+        "hint": "QQ 限制发出去 2 分钟内才能撤回，超过必然失败。设成 0 表示不限时间（仍会撞 QQ 的限制）。",
+        "default": 120
+      }
+    }
+  },
+  "brief": {
+    "description": "📝 群简报",
+    "type": "object",
+    "hint": "只影响 /群简报 指令。留空就用 AstrBot 当前对话的模型，填了就单独走这套 API，不占用聊天额度。",
+    "items": {
+      "brief_api_base": {
+        "description": "独立 API 地址",
+        "type": "string",
+        "hint": "OpenAI 兼容接口，例如 https://api.openai.com/v1。留空 = 用当前对话 AI。",
+        "default": ""
+      },
+      "brief_api_key": {
+        "description": "独立 API Key",
+        "type": "string",
+        "hint": "用独立 API 时必填。",
+        "default": "",
+        "secret": true
+      },
+      "brief_model": {
+        "description": "独立 API 模型名",
+        "type": "string",
+        "hint": "例如 gpt-4o-mini。填了这一项才会启用独立 API（base 和 key 也要有）。",
+        "default": ""
+      }
+    }
+  },
+  "output": {
+    "description": "🗣️ 输出行为",
+    "type": "object",
+    "hint": "指令回复的风格：是直接甩原始记录，还是让 AI 嚼一遍再说。",
+    "items": {
+      "llm_output": {
+        "description": "指令结果由 AI 加工",
+        "type": "bool",
+        "hint": "开着时 /查人 /私聊记录 会先交给模型聊成自然语言，不直接输出原文；关掉就原文照搬，适合排查数据源。",
+        "default": true
+      }
+    }
+  }
+}

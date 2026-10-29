@@ -58,4 +58,7 @@ support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.5.1"
 tags:
-  - astrbot
+  - qq
+  - group-chat
+  - history
+  - profile

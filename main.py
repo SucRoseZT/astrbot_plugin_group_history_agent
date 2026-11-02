@@ -231,7 +231,11 @@ class GroupHistoryAgentPlugin(Star):
                 )
             return (
                 "（提示：以下记录仅供你参考。请自然地和用户讨论其中的内容，"
-                "不要逐条复述，也不要一次性全部讲完。）\n" + text
+                "不要逐条复述，也不要一次性全部讲完。"
+                "另注：本工具读的是协议端的历史消息，你自己主动发出去的话"
+                "（转述、定时任务的推送）不一定出现在这份列表里。用户问"
+                "「你之前给某某发了什么」时，如果记忆包里有「你在其他会话发过的话」，"
+                "以那边为准；这里没看到不等于你没发过，别据此否认。）\n" + text
             )
         except Exception as e:
             logger.error(f"read_friend_recent_messages 内部异常: {type(e).__name__}: {e}")
@@ -628,6 +632,40 @@ class GroupHistoryAgentPlugin(Star):
         out = [str(p).strip() for p in parts if str(p).strip()]
         return out[:max(1, int(limit))]
 
+    def _relay_whitelist(self) -> set:
+        """转述白名单：填了 QQ 号就只认这些人。支持列表、逗号、空格、换行混写。"""
+        raw = self._cfg("relay.relay_whitelist", [])
+        if raw is None:
+            return set()
+        if isinstance(raw, str):
+            raw = [raw]
+        out = set()
+        for item in raw:
+            for piece in re.split(r"[\s,，;；、]+", str(item or "")):
+                piece = piece.strip()
+                if piece:
+                    out.add(piece)
+        return out
+
+    def _relay_allowed(self, event: AstrMessageEvent) -> bool:
+        """谁能用跨会话转述。两套模式互斥，白名单优先。
+
+        - 白名单非空 → 只认名单里的人（主人始终可用，名单是额外放行）；
+        - 白名单为空 → 按「私聊 / 群聊」两个开关分别判，各管各的场景。
+
+        这么设计是为了避免「开关说允许、白名单又说不行」的叠加歧义：
+        一旦填了名单，那两个开关就当没开过。
+        """
+        if event.is_admin():
+            return True
+        whitelist = self._relay_whitelist()
+        if whitelist:
+            uid = str(event.get_sender_id() or "").strip()
+            return bool(uid) and uid in whitelist
+        is_group = bool(event.get_group_id())
+        key = "relay.allow_members_group" if is_group else "relay.allow_members_private"
+        return self._cfg_bool(key, False)
+
     @filter.llm_tool(name="relay_message")
     async def relay_message(
         self, event: AstrMessageEvent, target: str, is_group: bool,
@@ -656,8 +694,13 @@ class GroupHistoryAgentPlugin(Star):
             message(string): 要转述的完整文本（单条模式；与 segments 二选一）
             segments(string): 分段模式：要连发的多段文本，用 ||| 分隔（换行也行）
         '''
-        if not event.is_admin() and not self._cfg_bool("relay.allow_members", False):
-            return "权限拒绝：跨会话转述仅限主人使用。"
+        if not self._relay_allowed(event):
+            if self._relay_whitelist():
+                return ("权限拒绝：跨会话转述当前是白名单模式，你不在名单里。"
+                        "让主人把你的 QQ 号加进「转述白名单」之后再用。")
+            where = "群里" if event.get_group_id() else "私聊"
+            return (f"权限拒绝：{where}的跨会话转述仅限主人使用"
+                    "（配置项 relay.allow_members_private / allow_members_group）。")
         target = str(target or "").strip()
         if not target:
             return "参数错误：target 不能为空。"
@@ -705,10 +748,14 @@ class GroupHistoryAgentPlugin(Star):
             "cause": str(getattr(event, "message_str", "") or "").strip()[:80],
             "source": str(getattr(event, "unified_msg_origin", "") or ""),
         }
+        # 联动开关：关掉就不打 sugarmemory 的标记，它那边按普通外发处理
+        # （记不记取决于它自己的配置，但绝不会被当成「转述」）。
+        tag_for_memory = self._cfg_bool("integration.sugarmemory_enable", True)
 
         def _chain(text: str) -> MessageChain:
             c = MessageChain(chain=[Plain(text)])
-            c._sugarmemory_relay = relay_tag
+            if tag_for_memory:
+                c._sugarmemory_relay = relay_tag
             return c
 
         if not parts:
@@ -728,23 +775,46 @@ class GroupHistoryAgentPlugin(Star):
 
         # ---- 分段模式：一次调用内部连发，冷却只消耗一次 ----
         delay = max(0, self._cfg_int("relay.segment_delay_ms", 900)) / 1000.0
-        sent = 0
-        for idx, seg in enumerate(parts):
-            try:
-                result = await self.context.send_message(
-                    session=session,
-                    message_chain=_chain(seg),
-                )
-                if result is False:
-                    logger.warning("[QQTools·Relay] 分段 %d/%d 发送返回 False", idx + 1, len(parts))
+
+        async def _send_all() -> int:
+            ok = 0
+            for idx, seg in enumerate(parts):
+                try:
+                    result = await self.context.send_message(
+                        session=session,
+                        message_chain=_chain(seg),
+                    )
+                    if result is False:
+                        logger.warning("[QQTools·Relay] 分段 %d/%d 发送返回 False",
+                                       idx + 1, len(parts))
+                        break
+                    ok += 1
+                    logger.info("[QQTools·Relay] 分段 %d/%d 已发: %r",
+                                idx + 1, len(parts), seg[:30])
+                except Exception as exc:
+                    logger.error("[QQTools·Relay] 分段 %d/%d 发送失败: %s",
+                                 idx + 1, len(parts), exc)
                     break
-                sent += 1
-                logger.info("[QQTools·Relay] 分段 %d/%d 已发: %r", idx + 1, len(parts), seg[:30])
-            except Exception as exc:
-                logger.error("[QQTools·Relay] 分段 %d/%d 发送失败: %s", idx + 1, len(parts), exc)
-                break
-            if idx < len(parts) - 1 and delay > 0:
-                await asyncio.sleep(delay)
+                if idx < len(parts) - 1 and delay > 0:
+                    await asyncio.sleep(delay)
+            return ok
+
+        # 和 sugar_debounce 唯一真正的冲突点：它靠取消 pipeline task 来合并用户
+        # 连发的消息，而分段连发中间有 sleep，正好落在取消窗口里——用户随口补
+        # 一句就会把转述掐成半截。这里把整段发送包成独立 task 再 shield：取消
+        # 信号照旧往上抛（不影响防抖对这条回复的抑制），但已排队的段一定发完。
+        if self._cfg_bool("integration.sugar_debounce_enable", True):
+            send_task = asyncio.ensure_future(_send_all())
+            try:
+                sent = await asyncio.shield(send_task)
+            except asyncio.CancelledError:
+                try:
+                    await send_task
+                except Exception:
+                    pass
+                raise
+        else:
+            sent = await _send_all()
 
         if not sent:
             return "发送失败：一条都没发出去，请检查 target 是否正确。"
@@ -758,51 +828,18 @@ class GroupHistoryAgentPlugin(Star):
 
     @filter.llm_tool(name="list_pending_requests")
     async def list_pending_requests(self, event: AstrMessageEvent, kind: str = "") -> str:
-        '''列出还没处理的加群申请和好友申请，每条带编号、申请人、留言和 flag。
+        '''列出还没处理的加群申请，每条带编号、申请人、留言和 flag。
 
-        用户问"有没有人申请加群""谁加我好友""待处理的申请"时用。处理申请必须先调
+        用户问"有没有人申请加群""待处理的申请"时用。处理申请必须先调
         这个拿到编号或 flag——flag 只在事件里出现一次，不攒起来就永远找不回来。
 
         Args:
-            kind(string): 只看哪一类：group（加群）/ friend（好友）/ 留空或不认识的值就看全部
+            kind(string): 兼容旧参数，现在只剩 group（加群）一类，传别的也当全部处理
         '''
         if self._cfg_bool("requests.owner_only", True) and not event.is_admin():
             return "权限拒绝：查看待处理申请仅限主人使用。"
-        kind = str(kind or "").strip().lower()
-        if kind not in ("group", "friend"):
-            kind = ""
+        kind = "group"
         rows = self._request_rows(kind)
-        # 软申请同步：列表阶段就尝试从 NapCat 可疑申请列表补真实 flag，
-        # 拿到的条目直接升级成正常申请（后续 handle 走标准流程）。
-        client = self._get_client(event)
-        if client is not None and any(
-                v.get("soft") or str(f).startswith(("soft:", "noflag:"))
-                for f, v in rows):
-            done_uids = set()
-            upgraded = 0
-            for f, v in rows:
-                uid = str(v.get("user_id") or "").strip()
-                if not uid or uid in done_uids:
-                    continue
-                done_uids.add(uid)
-                doubt_flag = await self._resolve_doubt_flag(client, uid)
-                if doubt_flag:
-                    self._pending_requests.pop(f, None)
-                    self._pending_requests[doubt_flag] = {
-                        "kind": v.get("kind") or "friend",
-                        "sub_type": v.get("sub_type") or "",
-                        "user_id": uid,
-                        "nickname": v.get("nickname") or "",
-                        "group_id": v.get("group_id") or "",
-                        "comment": v.get("comment") or "（可疑好友申请列表）",
-                        "ts": float(v.get("ts") or time.time()),
-                    }
-                    upgraded += 1
-                    logger.info(f"[QQTools·请求] 软申请升级为真flag: user={uid} "
-                                f"flag={doubt_flag[:16]}…")
-            if upgraded:
-                self._save_pending_requests()
-                rows = self._request_rows(kind)
         if not rows:
             if self._cfg_bool("requests.requests_enabled", True):
                 return ("当前没有待处理的申请。注意：机器人重启后这个列表会清空，"
@@ -817,10 +854,10 @@ class GroupHistoryAgentPlugin(Star):
     async def handle_request(
         self, event: AstrMessageEvent, flag: str, approve: bool, reason: str = ""
     ):
-        '''同意或拒绝一条加群申请／好友申请。
+        '''同意或拒绝一条加群申请。
 
         先调 list_pending_requests 看有哪些待处理，再把那里的编号（"1"、"2"）或
-        申请人 QQ 号传进来；直接传 flag 也行。插件会自动分辨是群还是好友申请。
+        申请人 QQ 号传进来；直接传 flag 也行。
 
         ⚠️ 这是不可逆操作，会真的把人放进来或拒之门外：
         - 用户没明说同意谁，就不要擅自同意，先问一句；
@@ -833,7 +870,7 @@ class GroupHistoryAgentPlugin(Star):
             reason(string): 拒绝理由，会推给对方看（同意时不用填）
         '''
         if self._cfg_bool("requests.owner_only", True) and not event.is_admin():
-            return "权限拒绝：处理加群/好友申请仅限主人使用。"
+            return "权限拒绝：处理加群申请仅限主人使用。"
         if not self._cfg_bool("requests.requests_enabled", True):
             return "申请处理功能已关闭。"
         key = str(flag or "").strip()
@@ -848,50 +885,20 @@ class GroupHistoryAgentPlugin(Star):
         client = self._get_client(event)
         if client is None:
             return "当前平台不是 aiocqhttp（OneBot 协议端），无法处理申请。"
-        if info.get("soft") or str(real_flag).startswith(("soft:", "noflag:")):
-            # 软申请 / 无 flag 申请：协议端没推 request 事件。先试试 NapCat 的
-            # 可疑好友申请接口（QQ 把「允许任何人临时会话」下发的申请归入该列表，
-            # 拉得到真实 flag，能直接代处理）。
-            uid = str(info.get("user_id") or "").strip()
-            doubt_flag = await self._resolve_doubt_flag(client, uid) if uid else None
-            if doubt_flag:
-                try:
-                    await client.api.call_action(
-                        "set_doubt_friends_add_request",
-                        flag=doubt_flag,
-                        approve=bool(approve),
-                    )
-                except Exception as e:
-                    logger.error(f"[QQTools·请求] 可疑申请处理失败: {type(e).__name__}: {e}")
-                    return (f"在可疑申请列表里找到了 {who} 的真实 flag，但处理失败："
-                            f"{type(e).__name__}: {e}。别反复重试，让主人在 QQ 客户端"
-                            "「联系人-新朋友」里手动处理。")
-                self._pending_requests.pop(real_flag, None)
-                self._save_pending_requests()
-                logger.info(f"[QQTools·请求] 已通过可疑申请通道{'同意' if approve else '拒绝'}: "
-                            f"user={uid} flag={doubt_flag[:16]}…")
-                return (f"已{'同意' if approve else '拒绝'} {who} 的好友申请"
-                        + ("（已加到好友列表）" if approve else "")
-                        + "。走的是可疑申请通道。到此为止，别再调一次。")
-            return (f"这一条（{who}）没有 flag，可疑申请列表里也找不到 TA，机器人无法"
-                    "代为同意或拒绝。让主人在 QQ 客户端的「联系人-新朋友」里手动处理，"
-                    "或者让对方删了重新加一次。别再对这条调本工具。")
+        if info.get("kind") != "group":
+            # 好友申请支持已移除：历史残留直接清掉，别让 AI 反复试一个不存在的通道
+            self._pending_requests.pop(real_flag, None)
+            self._save_pending_requests()
+            return ("这条不是加群申请（好友申请功能已移除），已从待处理列表里清掉。"
+                    "不需要再处理它，也不要再调本工具。")
         try:
-            if info.get("kind") == "group":
-                await client.api.call_action(
-                    "set_group_add_request",
-                    flag=real_flag,
-                    sub_type=info.get("sub_type") or "add",
-                    approve=bool(approve),
-                    reason="" if approve else (reason or ""),
-                )
-            else:
-                await client.api.call_action(
-                    "set_friend_add_request",
-                    flag=real_flag,
-                    approve=bool(approve),
-                    remark="" if not approve else (reason or "")[:60],
-                )
+            await client.api.call_action(
+                "set_group_add_request",
+                flag=real_flag,
+                sub_type=info.get("sub_type") or "add",
+                approve=bool(approve),
+                reason="" if approve else (reason or ""),
+            )
         except Exception as e:
             logger.error(f"[QQTools·请求] 处理申请失败: {type(e).__name__}: {e}")
             return (f"处理失败：{type(e).__name__}: {e}。"
@@ -900,66 +907,19 @@ class GroupHistoryAgentPlugin(Star):
         # 只有成功才弹出缓存：失败还能再试一次
         self._pending_requests.pop(real_flag, None)
         self._save_pending_requests()
-        if info.get("kind") == "group":
-            gid = info.get("group_id") or "?"
-            return (f"已{'同意' if approve else '拒绝'}{who} 对群 {gid} 的申请。"
-                    + ("" if approve else f"理由：{reason or '（未填）'}")) + "到此为止，别再调一次。"
-        return (f"已{'同意' if approve else '拒绝'}{who} 的好友申请。"
-                + ("（已加到好友列表）" if approve else "")) + "到此为止，别再调一次。"
-
-    @filter.llm_tool(name="send_friend_request")
-    async def send_friend_request(
-        self, event: AstrMessageEvent, user_id: str, message: str = ""
-    ):
-        '''主动向某个 QQ 号发送好友申请（不是处理别人的申请）。
-
-        注意这不在 OneBot v11 标准接口里，能不能成功取决于协议端版本。NapCat
-        较新的版本才有；不支持时会明确告诉你失败，别反复重试。
-
-        Args:
-            user_id(string): 要加的 QQ 号
-            message(string): 验证留言，会推给对方看（可不填）
-        '''
-        if not event.is_admin():
-            return "权限拒绝：主动加好友仅限主人使用。"
-        if not self._cfg_bool("requests.allow_send_friend_request", True):
-            return "主动加好友已关闭（requests.allow_send_friend_request=false）。"
-        uid = str(user_id or "").strip()
-        if not uid.isdigit():
-            return "参数错误：user_id 必须是纯数字 QQ 号。"
-        # 参数校验放前面：QQ 号都不对就没必要先去找协议端，也免得真正的错误
-        # 被「当前平台不支持」这句盖掉。
-        client = self._get_client(event)
-        if client is None:
-            return "当前平台不是 aiocqhttp（OneBot 协议端），无法发送好友申请。"
-        # 各协议端给这个能力起的名不统一，挨个试，都失败就如实说
-        last_err = ""
-        for action in ("add_friend", "friend_add", "ArkFriendAdd"):
-            try:
-                await client.api.call_action(action, user_id=int(uid), message=message or "")
-                logger.info(f"[QQTools·请求] 已发送好友申请 action={action} uid={uid}")
-                return (f"已向 {uid} 发送好友申请"
-                        + (f"（留言：{message}）" if message else "")
-                        + f"。用的是协议端的 {action} 接口。到此为止，别重复发送。")
-            except Exception as e:
-                last_err = f"{action}: {type(e).__name__}: {e}"
-                continue
-        logger.warning(f"[QQTools·请求] 主动加好友全部失败: {last_err}")
-        return (f"发送失败，当前协议端没有可用的主动加好友接口（试过 add_friend / "
-                f"friend_add / ArkFriendAdd）。最后错误：{last_err}。"
-                "可以换个支持该接口的协议端版本，或手动去加。")
+        gid = info.get("group_id") or "?"
+        return (f"已{'同意' if approve else '拒绝'}{who} 对群 {gid} 的申请。"
+                + ("" if approve else f"理由：{reason or '（未填）'}")) + "到此为止，别再调一次。"
 
     # ------------------------------------------------------------------ #
-    # 手动指令：/申请 [群/好友]                                            #
+    # 手动指令：/申请 [群]                                                 #
     # ------------------------------------------------------------------ #
     @filter.command("申请")
     async def requests_command(self, event: AstrMessageEvent):
-        """列出待处理的加群/好友申请，例如 /申请、/申请 好友"""
+        """列出待处理的加群申请，例如 /申请"""
         parts = event.message_str.strip().split()
         kind = parts[1] if len(parts) > 1 else ""
-        if kind in ("好友", "friend"):
-            kind = "friend"
-        elif kind in ("群", "group"):
+        if kind in ("群", "group"):
             kind = "group"
         else:
             kind = ""
@@ -1292,7 +1252,6 @@ class GroupHistoryAgentPlugin(Star):
             "relay_message",
             "list_pending_requests",
             "handle_request",
-            "send_friend_request",
         ]
         ok, missing = [], []
         for name in wanted:
@@ -2264,6 +2223,15 @@ class GroupHistoryAgentPlugin(Star):
             async def _wrapped(session, message_chain, *args, **kwargs):
                 result = await orig(session, message_chain, *args, **kwargs)
                 try:
+                    # 联动开关：sugarcron 的定时消息带 label 标记（转述的标记没有
+                    # label 字段，两者不冲突）。关掉联动就不把定时消息塞进缓存。
+                    tag = getattr(message_chain, "_sugarmemory_relay", None)
+                    if (
+                        isinstance(tag, dict)
+                        and tag.get("label")
+                        and not plugin._cfg_bool("integration.sugarcron_enable", True)
+                    ):
+                        return result
                     # MessageChain 没有 __iter__（对 it 直接 for 会 TypeError），
                     # 真正的消息段在 .chain 这个 list 上；也兼容有人直接传 list。
                     parts = getattr(message_chain, "chain", None)
@@ -2326,7 +2294,7 @@ class GroupHistoryAgentPlugin(Star):
     async def _cache_on_message(self, event: AstrMessageEvent):
         """把收到的消息存进缓存（优先级 100：尽早拿到，别被别的插件拦掉）。
 
-        顺手把「加群/好友申请」这类 request 事件分流出去：它长得像消息（有 group_id
+        顺手把「加群申请」这类 request 事件分流出去：它长得像消息（有 group_id
         时甚至会被当成群消息），塞进聊天缓存会污染「最近消息」，而它真正有用的是
         里面那串 flag——处理申请全靠它。
         """
@@ -2336,10 +2304,6 @@ class GroupHistoryAgentPlugin(Star):
             # 总比缓存悄悄失效、AI 又开始否认自己说过话强。
             self._hook_context_send()
             if self._catch_request_event(event):
-                return
-            if self._catch_soft_request_text(event):
-                # 软申请：NapCat 文本已单独入档，不再当普通聊天缓存（避免 AI
-                # 在「最近消息」里看到它却不知道那是申请信号）。
                 return
             self._cache_put(event)
         except Exception:
@@ -2371,6 +2335,9 @@ class GroupHistoryAgentPlugin(Star):
             ttl = max(0, self._cfg_int("requests.requests_ttl_hours", 24)) * 3600
             for k, v in data.items():
                 if not isinstance(v, dict):
+                    continue
+                if v.get("kind") != "group":
+                    # 好友申请支持已移除，旧版本落盘的好友条目直接丢弃
                     continue
                 if ttl and now - float(v.get("ts") or 0) > ttl:
                     continue
@@ -2412,7 +2379,8 @@ class GroupHistoryAgentPlugin(Star):
             return False
         flag = str(raw.get("flag") or "").strip()
         rtype = str(raw.get("request_type") or "").strip()
-        if rtype not in ("friend", "group"):
+        if rtype != "group":
+            # 好友申请支持已移除：这类事件直接忽略，不攒也不落盘。
             return False
         max_n = max(1, self._cfg_int("requests.requests_max", 50))
         ttl = max(0, self._cfg_int("requests.requests_ttl_hours", 24)) * 3600
@@ -2447,82 +2415,12 @@ class GroupHistoryAgentPlugin(Star):
         self._save_pending_requests()
         return True
 
-    # NapCat 在「加好友验证=允许任何人临时会话」模式下，好友申请不推 OneBot 标准
-    # request 事件（实测 2026-10-28 00:56 小明 申请：event_bus 只有一条空 notice，
-    # 没有 post_type=request），而是往消息流里塞一条「请求添加你为好友」的文本。
-    # 这条文本没有 flag，无法调 set_friend_add_request，但它是「有人想加好友」的
-    # 唯一信号——不识别的话 AI 会当没看见，或像实测那样瞎编「我没有权限处理」。
-    _SOFT_REQUEST_PATTERNS = (
-        "请求添加你为好友", "请求添加你", "申请添加你为好友", "请求加你为好友",
-    )
-
-    def _catch_soft_request_text(self, event: AstrMessageEvent) -> bool:
-        """识别 NapCat 塞进消息流的「请求添加你为好友」文本，记为无 flag 的软申请。"""
-        if not self._cfg_bool("requests.requests_enabled", True):
-            return False
-        if event.get_message_type() == MessageType.GROUP_MESSAGE:
-            return False  # 群里出现的同款文本是转发/聊天内容，不认
-        text = str(event.message_str or "").strip()
-        if not text or not any(p in text for p in self._SOFT_REQUEST_PATTERNS):
-            return False
-        # 同一个人 1 小时内已有记录（真申请或软申请）就不再堆软条目；真 flag
-        # 走 _catch_request_event 的独立 key，不受这里影响。
-        uid = str(event.get_sender_id() or "").strip()
-        if not uid:
-            return False
-        for v in self._pending_requests.values():
-            if str(v.get("user_id")) == uid \
-                    and time.time() - float(v.get("ts") or 0) < 3600:
-                return False
-        self._pending_requests[f"soft:{uid}"] = {
-            "kind": "friend",
-            "sub_type": "",
-            "user_id": uid,
-            "nickname": str(event.get_sender_name() or ""),
-            "group_id": "",
-            "comment": text,
-            "soft": True,  # 无 flag：set_friend_add_request 调不了，只能主人手动
-            "ts": time.time(),
-        }
-        logger.info(f"[QQTools·请求] 收到软好友申请（NapCat 文本，无 flag，仅提示用）: "
-                    f"user={uid} nickname={event.get_sender_name()}")
-        self._save_pending_requests()
-        return True
-
     def _request_rows(self, kind: str = "") -> list[tuple[str, dict]]:
         """按类型列出待处理申请，新的在前。"""
         rows = [(f, v) for f, v in self._pending_requests.items()
                 if not kind or v.get("kind") == kind]
         rows.sort(key=lambda x: float(x[1].get("ts") or 0), reverse=True)
         return rows
-
-    async def _resolve_doubt_flag(self, client, uid: str):
-        """尝试从 NapCat 的「可疑好友申请」列表里找到 uid 的真实 flag。
-
-        实测场景（2026-10-28）：QQ 设「允许任何人临时会话」时 NapCat 不推
-        request 事件，申请被 QQ 归入可疑/过滤列表，但 get_doubt_friends_add_request
-        拉得到（带 flag），set_doubt_friends_add_request 能直接处理。
-        找不到或接口不支持时返回 None。"""
-        try:
-            rows = await client.api.call_action(
-                "get_doubt_friends_add_request", count=20)
-        except Exception as e:
-            logger.info(f"[QQTools·请求] 可疑申请接口不可用: {type(e).__name__}: {e}")
-            return None
-        logger.info(f"[QQTools·请求] 可疑申请接口返回: type={type(rows).__name__} "
-                    f"content={str(rows)[:800]}")
-        if not rows:
-            logger.info("[QQTools·请求] 可疑申请列表为空")
-            return None
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            row_uid = str(row.get("user_id") or row.get("uin") or "")
-            if row_uid == str(uid):
-                flag = str(row.get("flag") or "").strip()
-                if flag:
-                    return flag
-        return None
 
     def _find_request(self, key: str):
         """按 flag / 列表序号 / QQ 号 定位一条申请。AI 拿长 flag 容易抄错，得让它用序号或 QQ。"""
@@ -2549,13 +2447,8 @@ class GroupHistoryAgentPlugin(Star):
         if ts:
             mins = int((time.time() - ts) / 60)
             age = f"{mins}分钟前" if mins < 60 else f"{mins // 60}小时前"
-        if v.get("kind") == "group":
-            kind_cn = "被邀请进群" if v.get("sub_type") == "invite" else "申请加群"
-            head = f"#{idx} [群申请] {kind_cn} 群{v.get('group_id') or '?'}｜{who}({qq})"
-        else:
-            head = f"#{idx} [好友申请] {who}({qq})"
-        if v.get("soft"):
-            head += "｜⚠️ 软申请（NapCat 未推申请事件，无 flag）：机器人不能代处理，需主人在 QQ 客户端「新朋友」里手动通过"
+        kind_cn = "被邀请进群" if v.get("sub_type") == "invite" else "申请加群"
+        head = f"#{idx} [群申请] {kind_cn} 群{v.get('group_id') or '?'}｜{who}({qq})"
         tail = f"｜留言：{v['comment']}" if v.get("comment") else ""
         return f"{head}{tail}｜{age}\n  flag={flag}"
 
@@ -2976,10 +2869,12 @@ class GroupHistoryAgentPlugin(Star):
         if show_qq and uid:
             lines.append(f"QQ：{uid}")
 
-        # 个性签名：stranger_info 的 long_nick，空间接口叫 signature
-        sig = str(info.get("long_nick") or info.get("signature") or "").strip()
-        if sig:
-            lines.append(f"个性签名：{sig}")
+        # 个性签名：stranger_info 的 long_nick，空间接口叫 signature。
+        # 独立开关，和「性别年龄地区」「空间深度资料」互不影响。
+        if self._cfg_bool("profile.show_signature", True):
+            sig = str(info.get("long_nick") or info.get("signature") or "").strip()
+            if sig:
+                lines.append(f"个性签名：{sig}")
 
         role = self.ROLE_CN.get(str(info.get("role") or ""), "")
         if role:

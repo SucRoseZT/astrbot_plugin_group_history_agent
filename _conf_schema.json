@@ -2,7 +2,7 @@
   "requests": {
     "description": "📥 申请处理",
     "type": "object",
-    "hint": "别人的加群申请、好友申请：机器人收到时把 flag 攒起来，AI 再决定同意还是拒绝。也能主动发好友申请（但那个接口不是每个协议端都有）。",
+    "hint": "别人的加群申请：机器人收到时把 flag 攒起来，AI 再决定同意还是拒绝。（主动加好友、处理好友申请的能力已移除）",
     "items": {
       "requests_enabled": {
         "description": "收集并处理申请",
@@ -22,16 +22,10 @@
         "hint": "防止攒太多占内存。超了丢最旧的。",
         "default": 50
       },
-      "allow_send_friend_request": {
-        "description": "允许主动加好友",
-        "type": "bool",
-        "hint": "主动向某个 QQ 发好友申请。不在 OneBot 标准里，NapCat 较新版本才支持，不支持会明确报错。",
-        "default": true
-      },
       "owner_only": {
         "description": "仅主人可用申请功能",
         "type": "bool",
-        "hint": "开 = 只有主人（admins_id 里的 QQ）能让 AI 查看待处理申请 / 同意 / 拒绝，其他人问一律权限拒绝。关 = 任何人都能让 AI 处理申请——注意这意味着别人可以让 AI 同意「他自己发的好友申请」，想清楚再关。",
+        "hint": "开 = 只有主人（admins_id 里的 QQ）能让 AI 查看待处理申请 / 同意 / 拒绝，其他人问一律权限拒绝。关 = 任何人都能让 AI 处理加群申请——想清楚再关。",
         "default": true
       }
     }
@@ -41,11 +35,26 @@
     "type": "object",
     "hint": "AI 把话带给其他 QQ 用户或群（原 astrbot_plugin_xrelay 功能）。防刷屏三件套：内容去重、目标冷却、废消息拦截。发送仍走 context.send_message，记忆插件的「转述起因」照常记录。",
     "items": {
-      "allow_members": {
-        "description": "允许普通成员使用转述",
+      "allow_members_private": {
+        "description": "允许私聊里的普通人使用转述",
         "type": "bool",
-        "hint": "关 = 只有主人能用跨会话转述；开 = 群里普通人也能让 AI 带话。放开后防刷屏三件套（目标冷却 / 内容去重 / 废消息拦截）对所有人同样生效，且冷却按「来源会话+目标」分开算。",
+        "hint": "关 = 私聊里只有主人能用跨会话转述；开 = 私聊里普通人也能让 AI 带话。与「群聊」那项彼此独立，可以只开一边。注意：白名单一旦填了，本项和群聊项都会失效，只认白名单。",
         "default": false
+      },
+      "allow_members_group": {
+        "description": "允许群聊里的普通人使用转述",
+        "type": "bool",
+        "hint": "关 = 群里只有主人能用跨会话转述；开 = 群里普通人也能让 AI 带话。注意：白名单一旦填了，本项和私聊项都会失效，只认白名单。",
+        "default": false
+      },
+      "relay_whitelist": {
+        "description": "转述白名单（填了就只认这里）",
+        "type": "list",
+        "hint": "填 QQ 号，一行一个。只要这里非空，上面「允许私聊/群聊里的普通人使用转述」两个开关就全部失效——只有名单里的人能用转述，主人始终可用。清空本项才回到开关模式。两者互斥，不会叠加。",
+        "default": [],
+        "items": {
+          "type": "string"
+        }
       },
       "allow_segments": {
         "description": "允许分段连发",
@@ -76,6 +85,31 @@
         "type": "int",
         "hint": "完全相同的内容（含分段拼接）在这个窗口内只发一次，换措辞才放行。0 = 关闭去重。",
         "default": 600
+      }
+    }
+  },
+  "integration": {
+    "description": "🔗 插件联动",
+    "type": "object",
+    "hint": "本插件和蔗糖系列插件的协作开关。关掉某一项只是不再和那个插件配合，本插件自己的功能不受影响。",
+    "items": {
+      "sugarmemory_enable": {
+        "description": "转述写入 sugarmemory 记忆",
+        "type": "bool",
+        "hint": "开着时，跨会话转述会在消息链上打 sugarmemory 认得的标记，记忆里记成「你转述给 xxx｜起因：用户原话」。关掉后不打标记，sugarmemory 会按普通外发处理（可能压根不记，取决于它自己的配置）。",
+        "default": true
+      },
+      "sugarcron_enable": {
+        "description": "定时任务消息进聊天缓存",
+        "type": "bool",
+        "hint": "开着时，sugarcron 定时发出去的消息也会进本插件缓存，AI 复盘「我几点发过提醒」时查得到。关掉后这些消息不进缓存，AI 会否认自己发过定时消息。",
+        "default": true
+      },
+      "sugar_debounce_enable": {
+        "description": "与 sugar_debounce 防抖协同",
+        "type": "bool",
+        "hint": "开着时，转述的分段连发是「原子」的：用户中途再发新消息也不会把剩下的段数掐断。关掉则恢复裸行为，分段可能只发出前几段。",
+        "default": true
       }
     }
   },
@@ -229,6 +263,12 @@
         "description": "显示性别年龄地区",
         "type": "bool",
         "hint": "协议端返回的详细资料。这些字段常不准（很多人乱填），默认开着但只作参考。",
+        "default": true
+      },
+      "show_signature": {
+        "description": "显示个性签名",
+        "type": "bool",
+        "hint": "单独控制签名这一项，和「性别年龄地区」「空间深度资料」完全解耦。关掉后查资料不输出签名，其余字段照常。只想保留资料不要签名时关这里。",
         "default": true
       },
       "show_qzone_detail": {

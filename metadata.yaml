@@ -2,7 +2,7 @@ name: astrbot_plugin_group_history_agent
 display_name: "蔗糖的QQ全套工具~"
 short_desc: 群聊私聊记录、模糊搜人看资料、等新消息，一个插件全包
 desc: |
-  为 AI 注册十三个工具（Agent 工具），覆盖「看记录」「看人」「动手」「带话」「处理申请」五件事：
+  为 AI 注册十二个工具（Agent 工具），覆盖「看记录」「看人」「动手」「带话」「处理申请」五件事：
 
   看记录
   - read_group_recent_messages：读当前群（或指定群）最近聊天记录，支持关键词、
@@ -16,8 +16,9 @@ desc: |
   - search_qq_user：按昵称/群名片/QQ号模糊搜群成员，返回候选人和 QQ 号，
     多个候选会列出来让你挑，不用先知道 QQ 号；
   - get_user_profile：查某人资料。基础字段（群名片、身份、QQ等级、群等级、
-    头衔、VIP、登录天数、性别年龄、个性签名）协议端直接给；生日、公司、职业、
+    头衔、VIP、登录天数、性别年龄）协议端直接给；生日、公司、职业、
     省市、学校、个性标签这些协议端没有，会借 QQ 空间的登录态另外查，拿不到就跳过。
+    个性签名有独立开关（show_signature），可以和资料其它字段分开控制。
     头像、背景图、昵称、QQ号是否出现可分别开关，图片能直接发出来。
 
   动手
@@ -27,18 +28,18 @@ desc: |
     长回复被分多段发送时，撤 1 条只撤最后一段，可以指定撤几条。
 
   带话（原 astrbot_plugin_xrelay 融合）
-  - relay_message：把话转述给其他 QQ 用户或群，仅限主人。支持一次调用分段连发
+  - relay_message：把话转述给其他 QQ 用户或群。权限按场景分开：私聊、群聊两个
+    开关（allow_members_private / allow_members_group），外加转述白名单——白名单
+    一旦填了就只认名单，两个开关同时失效。支持一次调用分段连发
     （像真人刷屏那样一条条发），带三重防刷屏：相同内容 10 分钟去重、同一目标
     2 分钟冷却、"请忽略/测试"这类占位废消息直接拦截。发送走 context.send_message，
     所以记忆插件记录的「转述说了什么、为什么发」照常生效。
 
-  处理申请
-  - list_pending_requests：列出还没处理的加群申请和好友申请（申请人、留言、编号）。
+  处理申请（只剩加群，好友申请与主动加好友已移除）
+  - list_pending_requests：列出还没处理的加群申请（申请人、留言、编号）。
     申请事件里的 flag 只出现一次，机器人收到就攒起来，AI 说话时才找得到；
-  - handle_request：同意或拒绝一条申请，传编号或 QQ 号即可（不用抄 flag），
-    自动分辨是群申请还是好友申请，拒绝理由会推给对方看。仅限主人；
-  - send_friend_request：主动向某个 QQ 号发好友申请。这个能力不在 OneBot v11
-    标准里，协议端不支持时会明确报错而不是静默失败。
+  - handle_request：同意或拒绝一条加群申请，传编号或 QQ 号即可（不用抄 flag），
+    拒绝理由会推给对方看。仅限主人。
 
   消息来源双通道：优先协议端 API（aiocqhttp / OneBot v11 的
   get_group_msg_history、get_group_member_list、get_group_member_info、
@@ -50,7 +51,7 @@ desc: |
   /查人 [名称] [群] 按人检索发言、/私聊记录 [条数] [好友] 查私聊、
   /搜人 [昵称] [群] 模糊搜成员、/资料 [昵称或QQ] [群] 看资料卡、
   /戳 [昵称或QQ] 戳一戳、/点赞 [昵称或QQ] [次数] 点赞、/撤回 [条数] 撤回自己、
-  /申请 [群/好友] 看待处理申请、/工具自检 逐个排查十三个工具的注册状态。
+  /申请 看待处理加群申请、/工具自检 逐个排查十二个工具的注册状态。
 version: 2.6.0
 author: SucRoseZT
 repo: https://github.com/SucRoseZT/astrbot_plugin_group_history_agent

@@ -52,7 +52,7 @@ desc: |
   /搜人 [昵称] [群] 模糊搜成员、/资料 [昵称或QQ] [群] 看资料卡、
   /戳 [昵称或QQ] 戳一戳、/点赞 [昵称或QQ] [次数] 点赞、/撤回 [条数] 撤回自己、
   /申请 看待处理加群申请、/工具自检 逐个排查十二个工具的注册状态。
-version: 2.6.0
+version: 2.6.1
 author: SucRoseZT
 repo: https://github.com/SucRoseZT/astrbot_plugin_group_history_agent
 support_platforms:

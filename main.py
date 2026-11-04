@@ -50,6 +50,13 @@ from astrbot.api.star import Context, Star
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 
+# 简繁/同音兜底用的拼音库。缺了不影响主流程，只是「龙蛋」搜不到「龍蛋」而已，
+# 所以软导入：装不上就静默降级，不让插件因为一个可选依赖起不来。
+try:
+    from pypinyin import lazy_pinyin as _lazy_pinyin
+except Exception:  # pragma: no cover - 环境缺依赖时走这条
+    _lazy_pinyin = None
+
 # 单次工具结果的文本长度上限，防止向模型上下文写入过大的工具结果
 _MAX_TOOL_RESULT_CHARS = 6000
 
@@ -59,6 +66,10 @@ _MAX_TOOL_RESULT_CHARS = 6000
 _INVISIBLE = re.compile(
     r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\u180e\ufeff\u1160\u3164]"
 )
+
+# 人名比对时一起抹掉的空白（含全角空格 U+3000）。QQ 昵称里「小豆 喵」很常见，
+# 用户复述时也会随手敲空格，按字面比就是两个人，模型只能报「查无此人」。
+_WS = re.compile(r"\s+")
 
 
 class GroupHistoryAgentPlugin(Star):
@@ -83,6 +94,13 @@ class GroupHistoryAgentPlugin(Star):
         # _relay_sent 记内容指纹（去重），_relay_target_ts 记「来源会话|目标」最近发送时间（冷却）
         self._relay_sent: dict[str, float] = {}
         self._relay_target_ts: dict[str, float] = {}
+        # 人名→QQ 的进程内缓存：{归一后的名字: {user_id, label, source, ts}}
+        # 只缓存「唯一命中」。多候选不缓存——下次问同一个人照样要重新列出来挑，
+        # 缓存了反而会给出过期判断。搜人要走三层兜底，缓存能把重复提问的开销压到零。
+        self._person_cache: dict[str, dict] = {}
+        # 名字→无声调拼音的缓存。简繁兜底要对整份群成员列表算拼音，没缓存时
+        # 500 人群每次搜人都要现算 500 次；同一个人被反复问就白烧 CPU。
+        self._py_cache: dict[str, str] = {}
         # 主动发送（定时任务/跨会话转述）也要进缓存，否则 AI 复盘时看不到自己说过的话
         self._hook_context_send()
 
@@ -250,27 +268,43 @@ class GroupHistoryAgentPlugin(Star):
     async def search_qq_user(
         self, event: AstrMessageEvent, name: str = "", group_id: str = ""
     ) -> str:
-        """按昵称模糊搜索群成员，拿到对方的 QQ 号。**此工具无需任何权限，群聊和私聊都能用**（私聊里要指定群号或群名）。当用户说"找一下某某"、"群里有个叫XX的"、"谁叫XX"、"帮我搜一下这个人"、"XX的QQ是多少"这类只知道昵称、不知道 QQ 号的问题时使用。返回候选列表（群名片、QQ号、身份），拿到 QQ 号后再用 get_user_profile 看详细资料。注意：本工具只搜**群成员**，查不认识的陌生人请让用户直接给 QQ 号。
+        """按昵称模糊搜人，拿到对方的 QQ 号。**无需任何权限，群聊和私聊都能用，私聊也不用给群号**。当用户说"找一下某某"、"群里有个叫XX的"、"谁叫XX"、"帮我搜一下这个人"、"XX的QQ是多少"、"转述给某某"这类只知道昵称、不知道 QQ 号的问题时使用。会依次查：当前群成员 → 好友列表 → 本实例聊天记录里出现过的人 → 机器人所在的其它群，所以不在当前群、甚至不是好友的人也可能搜到。**支持简繁和同音模糊**：搜「龙蛋」能找到「龍蛋」，搜错一个同音字也有机会命中（会排在精确匹配之后）。返回候选列表（名字、QQ号、来源），拿到 QQ 号后再用 get_user_profile 看详细资料、或用 relay_message 带话。**只有这里返回"没找到"时，才需要让用户直接提供 QQ 号。**
 
         Args:
             name(string): 要搜的昵称、群名片或 QQ 号，支持模糊匹配（给一部分就行）
-            group_id(string): 群号或群名称，支持模糊匹配；不填时群聊用当前群，私聊必须提供
+            group_id(string): 想优先搜哪个群，填群号或群名；不填时群聊用当前群、私聊自动走好友和聊天记录
         """
         if not self._cfg_bool("profile.profile_enabled", True):
             return "搜人功能已被管理员关闭。"
         try:
-            hits, label, err = await self._search_members(event, name, group_id)
+            hits, notes, err = await self._resolve_person(event, name, group_id)
             if err:
                 return err
-            if not hits:
-                return (
-                    f"在群「{label}」里没找到匹配「{name}」的成员。"
-                    "可以试试只给名字里的一两个字，或者让用户直接提供 QQ 号。"
+            if len(hits) == 1:
+                h = hits[0]
+                note = self._match_note(h)
+                tail = (
+                    "这不是精确命中。先跟用户确认是不是这个人，再继续。"
+                    if note else
+                    "可以直接把这个 QQ 号传给 get_user_profile 看资料，"
+                    "或传给 relay_message 带话。"
                 )
-            lines = [f"在群「{label}」里找到 {len(hits)} 个匹配「{name}」的成员："]
+                return (
+                    f"找到「{name}」：{h['label']} (QQ: {h['user_id']})"
+                    f"｜来源：{h.get('source') or '未知'}{note}"
+                    f"{h.get('extra') or ''}\n{tail}"
+                )
+            lines = [f"「{name}」匹配到 {len(hits)} 个人，来源和 QQ 号如下："]
             for i, m in enumerate(hits, 1):
-                lines.append(f"{i}. {m['label']} (QQ: {m['user_id']}){m['extra']}")
-            lines.append("要查看其中某人的完整资料，把对应 QQ 号传给 get_user_profile。")
+                lines.append(
+                    f"{i}. {m['label']} (QQ: {m['user_id']})"
+                    f"{m.get('extra') or ''}｜{m.get('source') or '未知'}"
+                    f"{self._match_note(m)}"
+                )
+            if notes:
+                # 提示模型：这几层是「没命中」而不是「不存在」，别据此下结论
+                lines.append(f"（检索备注：{notes}）")
+            lines.append("需要哪一个，就把对应 QQ 号传给后面的工具。")
             return "\n".join(lines)
         except Exception as e:
             logger.error(f"search_qq_user 异常: {type(e).__name__}: {e}")
@@ -283,7 +317,7 @@ class GroupHistoryAgentPlugin(Star):
     async def get_user_profile(
         self, event: AstrMessageEvent, user: str = "", group_id: str = ""
     ) -> str:
-        """查看某个 QQ 用户的资料：群名片、昵称、QQ号、群身份、等级、头衔、性别年龄地区，头像可选。**无需任何权限**，群聊和私聊都能用。当用户说"看看这个人的资料"、"XX是谁"、"他QQ多少"、"这人什么来头"、"查一下这个号"时使用。user 可以填 QQ 号，也可以填昵称（会先模糊搜索，命中多个会列出来让你确认）。不填 user 时查当前说话的人。头像是否输出、昵称和 QQ 号是否显示，由插件配置决定。
+        """查看某个 QQ 用户的资料：群名片、昵称、QQ号、群身份、等级、头衔、性别年龄地区，头像可选。**无需任何权限**，群聊和私聊都能用，私聊里填昵称也能查。当用户说"看看这个人的资料"、"XX是谁"、"他QQ多少"、"这人什么来头"、"查一下这个号"、"转述给某某（先看看是谁）"时使用。user 可以填 QQ 号，也可以填昵称/群名片——会依次在群成员、好友列表、本实例聊天记录、其它群里找，**支持简繁和同音模糊**（填「龙蛋」也能查到「龍蛋」），命中多个会列出来让你确认。不填 user 时查当前说话的人。头像是否输出、昵称和 QQ 号是否显示，由插件配置决定。
 
         Args:
             user(string): QQ 号，或昵称/群名片（支持模糊）；不填则查当前说话的人
@@ -294,22 +328,23 @@ class GroupHistoryAgentPlugin(Star):
 
         target = str(user or "").strip()
         gid, group_label = "", ""
+        fuzzy_note = ""
         try:
             if target and not target.isdigit():
-                hits, group_label, err = await self._search_members(event, target, group_id)
+                hits, _notes, err = await self._resolve_person(event, target, group_id)
                 if err:
                     return err
-                if not hits:
-                    return (
-                        f"没找到匹配「{target}」的群成员。请让用户确认昵称，"
-                        "或者直接提供 QQ 号。"
-                    )
                 if len(hits) > 1:
                     lines = [f"「{target}」匹配到 {len(hits)} 个人，请先确认是哪一个："]
                     for i, m in enumerate(hits, 1):
-                        lines.append(f"{i}. {m['label']} (QQ: {m['user_id']}){m['extra']}")
+                        lines.append(
+                            f"{i}. {m['label']} (QQ: {m['user_id']})"
+                            f"{m.get('extra') or ''}｜{m.get('source') or '未知'}"
+                            f"{self._match_note(m)}"
+                        )
                     lines.append("确认后把 QQ 号再传给本工具。")
                     return "\n".join(lines)
+                fuzzy_note = self._match_note(hits[0])
                 target = str(hits[0]["user_id"])
             elif not target:
                 target = str(event.get_sender_id() or "")
@@ -327,6 +362,8 @@ class GroupHistoryAgentPlugin(Star):
                 return f"没查到 QQ {target} 的资料（协议端不返回或对方设置了隐私）。"
 
             text = self._render_profile(info)
+            if fuzzy_note:
+                text = f"（按「{user}」{fuzzy_note.strip('｜')}）\n" + text
             as_image = self._cfg_bool("profile.avatar_as_image", True)
             if self._cfg_bool("profile.show_avatar", True):
                 url = f"https://q1.qlogo.cn/g?b=qq&nk={target}&s=640"
@@ -673,6 +710,9 @@ class GroupHistoryAgentPlugin(Star):
     ):
         '''跨会话转述：把一条话带给其他 QQ 用户或群。
 
+        target 可以直接填对方的昵称/群名片，或者群名，插件自己解析成号码；
+        拿不到才需要先调 search_qq_user。不用为了「转述给某某」专门回头问用户要 QQ 号。
+
         两种用法二选一：
         - 转述一段完整的话 → 填 message，单条发出；
         - 用户要求"分段发""连发几条""一句一句发""像聊天那样刷过去" → 填 segments，
@@ -689,7 +729,8 @@ class GroupHistoryAgentPlugin(Star):
         5. 发送成功后不要重发、不要二次确认，也不要向当前用户复述转述正文，只给一句简短回执。
 
         Args:
-            target(string): 目标 QQ 号或群号
+            target(string): 目标 QQ 号或群号；**也可以直接填昵称/群名片/群名**，
+                插件会自己解析成号码。同名多候选会列出来让你确认，确认后填号码重试。
             is_group(boolean): 目标是否为群聊，true 为群，false 为私聊用户
             message(string): 要转述的完整文本（单条模式；与 segments 二选一）
             segments(string): 分段模式：要连发的多段文本，用 ||| 分隔（换行也行）
@@ -704,6 +745,57 @@ class GroupHistoryAgentPlugin(Star):
         target = str(target or "").strip()
         if not target:
             return "参数错误：target 不能为空。"
+
+        # 名字也能直接转述：旧实现只认号码，模型必须先自己查到 QQ 才发得出去；
+        # 而它能用的搜人工具只查群成员，私聊里根本查不到——于是每次都回头问用户要号。
+        # 这里把解析收到工具内部：号码原样透传，名字走同一条兜底链。
+        # 解析失败/多候选一律不发送、也不消耗冷却，避免「挑人」把发送额度吃掉。
+        if is_group:
+            if not target.isdigit():
+                gid, glabel, gerr = await self._resolve_group(event, target)
+                if gerr:
+                    return f"没找到目标群：{gerr}"
+                logger.info("[QQTools·Relay] 群名解析: %s → %s(%s)", target, glabel, gid)
+                target = gid
+        elif not target.isdigit():
+            try:
+                hits, _notes, perr = await self._resolve_person(event, target)
+            except Exception as e:
+                hits, perr = [], f"{type(e).__name__}: {e}"
+            if perr:
+                return perr
+            # 同音/形似命中不能直接发出去：字不一样就可能是另一个人，
+            # 转述发错人是收不回来的，必须让用户点头。精确命中才自动发。
+            try:
+                best = max(int(m.get("score") or 0) for m in hits)
+            except (TypeError, ValueError):
+                best = 0
+            if best < 60:
+                lines = [
+                    f"「{target}」没有精确命中，只有同音/形似的候选，"
+                    "先确认是不是这个人（本次未发送任何消息）："
+                ]
+                for i, m in enumerate(hits, 1):
+                    lines.append(
+                        f"{i}. {m['label']} (QQ: {m['user_id']})"
+                        f"｜{m.get('source') or '未知'}{self._match_note(m)}"
+                    )
+                lines.append("确认后把对应 QQ 号填进 target 重新调用。")
+                return "\n".join(lines)
+            if len(hits) > 1:
+                lines = [f"「{target}」匹配到 {len(hits)} 个人，先确认发给谁（本次未发送任何消息）："]
+                for i, m in enumerate(hits, 1):
+                    lines.append(
+                        f"{i}. {m['label']} (QQ: {m['user_id']})"
+                        f"｜{m.get('source') or '未知'}"
+                    )
+                lines.append("让用户确认后，把对应 QQ 号填进 target 重新调用。")
+                return "\n".join(lines)
+            logger.info(
+                "[QQTools·Relay] 昵称解析: %s → %s(%s)",
+                target, hits[0].get("label"), hits[0]["user_id"],
+            )
+            target = str(hits[0]["user_id"])
 
         allow_seg = self._cfg_bool("relay.allow_segments", True)
         max_seg = max(1, min(self._cfg_int("relay.max_segments", 5), 10))
@@ -1063,27 +1155,28 @@ class GroupHistoryAgentPlugin(Star):
     # ------------------------------------------------------------------ #
     @filter.command("搜人")
     async def search_user_command(self, event: AstrMessageEvent):
-        """按昵称模糊搜索群成员，列出候选人和 QQ 号"""
+        """按昵称模糊搜人，列出候选人和 QQ 号（群成员/好友/聊天记录/其它群依次找）"""
         parts = event.message_str.strip().split()
         if len(parts) < 2:
             yield event.plain_result(
                 "用法：/搜人 [昵称或QQ] [群号或群名]\n"
                 "例如：/搜人 小豆　　或　　/搜人 小豆 测试群\n"
-                "昵称给一部分就行，多个匹配会全部列出来。"
+                "昵称给一部分就行，多个匹配会全部列出来。\n"
+                "私聊里不用给群名：会自动去好友列表和本实例聊天记录里找。"
             )
             return
         name = parts[1]
         group_query = parts[2] if len(parts) > 2 else ""
-        hits, label, err = await self._search_members(event, name, group_query)
+        hits, _notes, err = await self._resolve_person(event, name, group_query)
         if err:
             yield event.plain_result(err)
             return
-        if not hits:
-            yield event.plain_result(f"在群「{label}」里没找到匹配「{name}」的成员。")
-            return
-        lines = [f"群「{label}」里匹配「{name}」的成员（{len(hits)} 个）："]
+        lines = [f"「{name}」匹配到 {len(hits)} 个人："]
         for i, m in enumerate(hits, 1):
-            lines.append(f"{i}. {m['label']} (QQ: {m['user_id']}){m['extra']}")
+            lines.append(
+                f"{i}. {m['label']} (QQ: {m['user_id']}){m.get('extra') or ''}"
+                f"｜{m.get('source') or '未知'}{self._match_note(m)}"
+            )
         lines.append("看某人的资料卡：/资料 QQ号")
         yield event.plain_result("\n".join(lines))
 
@@ -1103,17 +1196,17 @@ class GroupHistoryAgentPlugin(Star):
             target = str(event.get_sender_id() or "")
 
         if target and not target.isdigit():
-            hits, _label, err = await self._search_members(event, target, group_query)
+            hits, _notes, err = await self._resolve_person(event, target, group_query)
             if err:
                 yield event.plain_result(err)
-                return
-            if not hits:
-                yield event.plain_result(f"没找到匹配「{target}」的群成员。")
                 return
             if len(hits) > 1:
                 lines = [f"「{target}」匹配到 {len(hits)} 个人，要查哪一个？"]
                 for i, m in enumerate(hits, 1):
-                    lines.append(f"{i}. {m['label']} (QQ: {m['user_id']}){m['extra']}")
+                    lines.append(
+                        f"{i}. {m['label']} (QQ: {m['user_id']}){m.get('extra') or ''}"
+                        f"｜{m.get('source') or '未知'}{self._match_note(m)}"
+                    )
                 lines.append("用法：/资料 QQ号")
                 yield event.plain_result("\n".join(lines))
                 return
@@ -2479,8 +2572,63 @@ class GroupHistoryAgentPlugin(Star):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _norm_name(value) -> str:
-        """人名归一：剥掉不可见字符、统一大小写，用于比对（不影响展示）。"""
-        return _INVISIBLE.sub("", str(value or "")).strip().casefold()
+        """人名归一：剥掉不可见字符和**所有空白**、统一大小写，用于比对。
+
+        中间的空白必须一起删：昵称「小豆 喵」「小豆　喵」和用户嘴里随手打的
+        「小豆 喵」按字面比全是三个不同的人。删空白对中文名没有副作用；
+        英文名最多把「John Doe」和「JohnDoe」当成同一个——本来就是模糊搜，
+        认成一个人比认不出来强。
+        """
+        return _WS.sub("", _INVISIBLE.sub("", str(value or ""))).casefold()
+
+    def _py_key(self, value) -> str:
+        """名字 → 无声调拼音串，用来兜「龙蛋 vs 龍蛋」这种同音不同字。
+
+        简繁转换本来要靠 OpenCC，但那是个几十兆的词典；这里退一步用拼音：
+        绝大多数简繁对都是同音的（龍/龙 long、發/发 fa），代价是同音字也会被
+        认成一个人（龙蛋 vs 龙丹）。所以这一档分数只给 55，低于「真命中」的
+        60，只在没有任何更好的候选时才拿出来，不会盖过精确匹配。
+        """
+        if _lazy_pinyin is None:
+            return ""
+        key = self._norm_name(value)
+        if not key:
+            return ""
+        cached = self._py_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            val = "".join(_lazy_pinyin(key))
+        except Exception:
+            val = ""
+        if len(self._py_cache) > 2000:
+            self._py_cache.clear()
+        self._py_cache[key] = val
+        return val
+
+    def _max_results(self) -> int:
+        """候选上限。名字撞车时想一次看全就把它调大。"""
+        try:
+            return max(1, min(int(self._cfg("search.max_results", 10) or 10), 30))
+        except (TypeError, ValueError):
+            return 10
+
+    @staticmethod
+    def _match_note(hit: dict) -> str:
+        """给模糊命中加一句说明，别让模型把「同音」当成「就是这个人」。
+
+        60 分以上是真命中（全等/包含），55 是同音（简繁对多半落这里），
+        30 是字符凑巧全覆盖。后两档都要在输出里标明。
+        """
+        try:
+            score = int(hit.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        if score >= 60:
+            return ""
+        if score >= 50:
+            return "｜同音匹配（字不完全一样，跟用户确认一下）"
+        return "｜形似匹配（只凑上几个字，跟用户确认一下）"
 
     ROLE_CN = {"owner": "群主", "admin": "管理员", "member": "成员"}
 
@@ -2504,7 +2652,9 @@ class GroupHistoryAgentPlugin(Star):
     def _match_members(self, members: list, query: str) -> list:
         """在群成员列表里按昵称模糊找人。
 
-        打分优先级：QQ 号全等 > 昵称/群名片全等 > 子串包含 > 字符全覆盖。
+        打分优先级：QQ 号全等 > 昵称/群名片全等 > 子串包含 > 同音（简繁）> 字符全覆盖。
+        倒数第二条是为了「龙蛋」能搜到「龍蛋」——简繁对大多同音，用拼音串比对，
+        分数压在 55（低于真命中的 60），只在没有更好的候选时才拿出来。
         最后一条是为了对付「小豆喵」和「喵小豆」这种顺序不一样、人却认得出来的写法；
         但只在查询词至少两个字时才启用，否则单字会把整个群都匹配进来。
         """
@@ -2514,6 +2664,8 @@ class GroupHistoryAgentPlugin(Star):
         # 至少两个字、且字不重复才启用字符集合匹配：
         # 「豆豆」去重后只剩一个「豆」，拿它当集合会把所有带「豆」的人都捞出来。
         use_set = len(qn) >= 2 and len(q_chars) >= 2
+        variant = self._cfg_bool("search.fuzzy_variant", True) and len(qn) >= 2
+        qpy = self._py_key(qn) if variant else ""
         scored = []
         for m in members:
             if not isinstance(m, dict):
@@ -2529,8 +2681,12 @@ class GroupHistoryAgentPlugin(Star):
             if not score and qn:
                 if qn == nick or qn == card:
                     score = 90
+                elif nick.startswith(qn) or card.startswith(qn):
+                    score = 70
                 elif qn in nick or qn in card:
                     score = 60
+                elif qpy and qpy in (self._py_key(nick), self._py_key(card)):
+                    score = 55
                 elif use_set and q_chars <= (set(nick) | set(card)):
                     score = 30
             if score:
@@ -2538,7 +2694,7 @@ class GroupHistoryAgentPlugin(Star):
         scored.sort(key=lambda x: (-x[0], str(x[1].get("user_id") or "")))
 
         hits = []
-        for score, m in scored[:10]:
+        for score, m in scored[: self._max_results()]:
             label, extra = self._member_label(m)
             hits.append({
                 "user_id": str(m.get("user_id") or ""),
@@ -2594,18 +2750,325 @@ class GroupHistoryAgentPlugin(Star):
         qn = self._norm_name(name)
         if not qn:
             return []
+        variant = self._cfg_bool("search.fuzzy_variant", True) and len(qn) >= 2
+        qpy = self._py_key(qn) if variant else ""
         hits = []
         for f in friends:
             if not isinstance(f, dict):
                 continue
             uid = str(f.get("user_id") or "")
-            nick = self._norm_name(f.get("nickname"))
-            remark = self._norm_name(f.get("remark"))
-            if qn in nick or qn in remark:
-                display = str(f.get("remark") or f.get("nickname") or uid)
-                hits.append({"user_id": uid, "label": display,
-                             "extra": "", "score": 60})
-        return hits[:10]
+            nick_raw = str(f.get("nickname") or "").strip()
+            remark_raw = str(f.get("remark") or "").strip()
+            nick = self._norm_name(nick_raw)
+            remark = self._norm_name(remark_raw)
+            # 前缀命中要压过中间包含：「小豆」应该先给「小豆喵」，而不是
+            # 「正小豆」这种把关键字塞在中间的名字，否则排序看着像乱来。
+            score = 0
+            if qn and qn == remark:
+                score = 95
+            elif qn and qn == nick:
+                score = 90
+            elif qn and (remark.startswith(qn) or nick.startswith(qn)):
+                score = 70
+            elif qn and (qn in nick or qn in remark):
+                score = 60
+            elif qpy and qpy in (self._py_key(nick), self._py_key(remark)):
+                # 「龙蛋」搜「龍蛋」走这里：同音不同字，只当保底候选
+                score = 55
+            if score:
+                use_remark = bool(remark_raw) and (
+                    remark == qn or qn in remark or remark.startswith(qn)
+                )
+                display = remark_raw if use_remark else (nick_raw or remark_raw or uid)
+                # 备注和昵称都摊出来：AI 认人靠这两样，用户看到「这个名字哪来的」
+                # 也能立刻对上号（备注是自己起的，昵称是对方资料里那个）。
+                bits = []
+                if use_remark and nick_raw and nick_raw != remark_raw:
+                    bits.append(f"昵称: {nick_raw}")
+                elif not use_remark and remark_raw and remark_raw != nick_raw:
+                    bits.append(f"备注: {remark_raw}")
+                hits.append({
+                    "user_id": uid,
+                    "label": display,
+                    "extra": ("  " + "  ".join(bits)) if bits else "",
+                    "score": score,
+                    "source": "好友备注" if use_remark else "好友昵称",
+                })
+        hits.sort(key=lambda h: (-h["score"], h["user_id"]))
+        return hits[: self._max_results()]
+
+    # ------------------------------------------------------------------ #
+    # 身份解析：把「一个名字」变成 QQ 号                                   #
+    # ------------------------------------------------------------------ #
+    def _person_cache_get(self, query: str) -> dict | None:
+        """查人名→QQ 缓存。ttl<=0 视为关闭缓存。"""
+        key = self._norm_name(query)
+        if not key:
+            return None
+        item = self._person_cache.get(key)
+        if not item:
+            return None
+        try:
+            raw_ttl = self._cfg("search.person_cache_seconds", 1800)
+            ttl = 1800 if raw_ttl is None or str(raw_ttl).strip() == "" else int(raw_ttl)
+        except (TypeError, ValueError):
+            ttl = 1800
+        if ttl <= 0:
+            self._person_cache.pop(key, None)
+            return None
+        if time.time() - float(item.get("ts") or 0) > ttl:
+            self._person_cache.pop(key, None)
+            return None
+        return item
+
+    def _person_cache_put(self, query: str, hit: dict) -> None:
+        key = self._norm_name(query)
+        if not key:
+            return
+        self._person_cache[key] = {**hit, "ts": time.time()}
+        # 防无限涨：超过 500 条按时间淘汰最旧的 100 条
+        if len(self._person_cache) > 500:
+            oldest = sorted(
+                self._person_cache.items(), key=lambda kv: kv[1].get("ts") or 0
+            )
+            for k, _ in oldest[:100]:
+                self._person_cache.pop(k, None)
+
+    def _search_cached_senders(self, query: str) -> list:
+        """在本插件自己攒的消息缓存里翻人。
+
+        价值在覆盖面：好友列表里没有、当前群也没有的人，只要在这个实例的任意
+        会话里说过话，这里就有他的 QQ。零 API 调用，纯内存扫描；每个会话的
+        deque 上限 300 条，几十个会话扫一遍也就几毫秒。
+        """
+        qn = self._norm_name(query)
+        digits = "".join(ch for ch in str(query) if ch.isdigit())
+        if not qn:
+            return []
+        variant = self._cfg_bool("search.fuzzy_variant", True) and len(qn) >= 2
+        qpy = self._py_key(qn) if variant else ""
+        seen: dict[str, dict] = {}
+        for buf in list(self._msg_cache.values()):
+            for rec in list(buf):
+                uid = str(rec.get("sender_id") or "")
+                name = self._norm_name(rec.get("sender"))
+                if not uid or uid == "0" or not name:
+                    continue
+                score = 0
+                if digits and uid == digits:
+                    score = 100
+                elif qn == name:
+                    score = 90
+                elif name.startswith(qn):
+                    score = 70
+                elif qn in name:
+                    score = 60
+                elif qpy and qpy == self._py_key(name):
+                    score = 55
+                if not score:
+                    continue
+                prev = seen.get(uid)
+                if prev is not None and prev["score"] >= score:
+                    continue
+                seen[uid] = {
+                    "user_id": uid,
+                    "label": str(rec.get("sender") or uid),
+                    "extra": "",
+                    "score": score,
+                    "source": "聊天记录",
+                }
+        return sorted(seen.values(), key=lambda h: (-h["score"], h["user_id"]))[
+            : self._max_results()
+        ]
+
+    async def _search_all_groups(
+        self, event: AstrMessageEvent, query: str, skip_gid: str = ""
+    ) -> list:
+        """把机器人所在的群挨个翻一遍找人。
+
+        最后一道兜底：目标既不是好友、不在当前群，也从没在本实例说过话，
+        那只剩「他在别的群」这一种可能。代价是每个群一次 get_group_member_list，
+        所以只在前面全空时才调用，并且限群数、限并发、失败静默跳过——
+        扫不完就不算数，绝不因为某个群报错让整个搜人失败。
+        """
+        if not self._cfg_bool("search.deep_group_scan", True):
+            return []
+        client = self._get_client(event)
+        if client is None:
+            return []
+        try:
+            ret = await client.api.call_action("get_group_list")
+        except Exception as e:
+            logger.debug(f"get_group_list 不可用（跳过全群扫描）: {type(e).__name__}: {e}")
+            return []
+        groups = ret if isinstance(ret, list) else (
+            ret.get("data") if isinstance(ret, dict) else None
+        )
+        if not isinstance(groups, list):
+            return []
+
+        gname_of: dict[str, str] = {}
+        gids: list[str] = []
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get("group_id") or "")
+            if not gid or gid == str(skip_gid or ""):
+                continue
+            gname_of[gid] = str(g.get("group_name") or gid)
+            gids.append(gid)
+        try:
+            limit = max(1, int(self._cfg("search.deep_scan_group_limit", 20) or 20))
+        except (TypeError, ValueError):
+            limit = 20
+        gids = gids[:limit]
+        if not gids:
+            return []
+
+        sem = asyncio.Semaphore(5)
+        hits: list[dict] = []
+
+        async def _scan(gid: str) -> None:
+            async with sem:
+                try:
+                    r = await client.api.call_action(
+                        "get_group_member_list", group_id=int(gid)
+                    )
+                except Exception as e:
+                    logger.debug(f"全群扫描跳过 {gid}: {type(e).__name__}: {e}")
+                    return
+                members = r if isinstance(r, list) else (
+                    r.get("data") if isinstance(r, dict) else None
+                )
+                if not isinstance(members, list):
+                    return
+                for h in self._match_members(members, query)[: max(2, self._max_results() // 3)]:
+                    hits.append({**h, "source": f"群「{gname_of.get(gid, gid)}」"})
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(_scan(g) for g in gids)), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            # 扫不完就把已经拿到的交出去：宁可给部分候选，也别让工具卡几十秒
+            logger.debug("[QQTools·搜人] 全群扫描超时，返回已扫到的 %d 条", len(hits))
+        return sorted(hits, key=lambda h: (-h.get("score", 0), h["user_id"]))[
+            : self._max_results()
+        ]
+
+    async def _resolve_person(
+        self, event: AstrMessageEvent, query: str, group_query: str = "",
+        deep: bool = True,
+    ) -> tuple:
+        """把「昵称/群名片/QQ号」解析成候选列表，逐层兜底。
+
+        修的是「私聊里想转述给某人，AI 拿不到 QQ 只能回头问用户」这个问题。
+        旧实现三条路全堵死：好友列表兜底只接了 poke/like，搜人工具只认群成员，
+        私聊没群号直接报错。
+
+        分层顺序按成本从低到高，命中即止：
+          纯数字 → 进程缓存 → 群成员 → 好友列表 → 本地消息缓存 → 全群扫描
+
+        返回 (hits, notes, err)。某一层失败不中断后面的层，原因塞进 notes 给
+        模型看，让它知道还剩哪些路没走过；err 只在一个人都没找到时给。
+        """
+        raw = str(query or "").strip()
+        if not raw:
+            return [], "", "请提供要查的人：昵称、群名片或 QQ 号都行。"
+
+        # 1) 纯数字：就是号本身，不用查
+        if raw.isdigit():
+            return ([{
+                "user_id": raw, "label": raw, "extra": "",
+                "score": 100, "source": "直接给定",
+            }], "", "")
+
+        # 2) 进程内缓存：同一个人反复问，别每次都把整条兜底链重跑
+        cached = self._person_cache_get(raw)
+        if cached:
+            return ([cached], "（命中上次查过的结果）", "")
+
+        notes: list[str] = []
+        strong: list[dict] = []
+        weak: list[dict] = []
+
+        def _collect(layer: list, source: str) -> bool:
+            """收一层结果。分数 >=60 算真命中并终止；<60 的形似只留作最后兜底。
+
+            字符集合匹配（score 30）能把「小豆喵」和「喵小豆」认成一个人，但也
+            会把一整群带同一个字的人都捞出来。拿它当真命中会挡住后面更准的层。
+            """
+            got = False
+            for h in layer:
+                h = {**h, "source": h.get("source") or source}
+                if h.get("score", 0) >= 60:
+                    strong.append(h)
+                    got = True
+                else:
+                    weak.append(h)
+            return got
+
+        # 3) 群成员：群聊不填群号用当前群；私聊没有群号会报错，记下原因继续走
+        try:
+            ghits, glabel, gerr = await self._search_members(event, raw, group_query)
+        except Exception as e:
+            ghits, glabel, gerr = [], "", f"{type(e).__name__}: {e}"
+        if not _collect(ghits, f"群「{glabel}」") and gerr:
+            # 私聊里没给群号是正常路径（下面还有好友/聊天记录/全群），不是失败，
+            # 别把「请提供群号」塞进备注——模型会当成「还缺参数」反复去问用户。
+            if event.get_group_id() or group_query:
+                notes.append(gerr)
+
+        # 4) 好友列表：私聊没有群成员列表可搜，这一层是私聊的主力
+        if not strong:
+            try:
+                fhits = await self._search_friends(event, raw)
+            except Exception as e:
+                fhits = []
+                notes.append(f"好友列表查询失败：{type(e).__name__}")
+            if not _collect(fhits, "好友"):
+                notes.append("好友列表里没有这个人")
+
+        # 5) 本地消息缓存：任何会话里说过话的人都在这儿，零 API 调用
+        if not strong:
+            if not _collect(self._search_cached_senders(raw), "聊天记录"):
+                notes.append("本实例的聊天记录里也没出现过")
+
+        # 6) 全群扫描：只剩「他在别的群」这一种可能时才跑，最贵的一层
+        if not strong and deep:
+            try:
+                all_hits = await self._search_all_groups(
+                    event, raw, skip_gid=event.get_group_id() or ""
+                )
+            except Exception as e:
+                all_hits = []
+                notes.append(f"全群扫描失败：{type(e).__name__}")
+            if not _collect(all_hits, "其他群"):
+                notes.append("机器人所在的群里也没找到")
+
+        if not strong and weak:
+            notes.append("只有形似的候选，没有确定的那个")
+            strong = weak
+
+        if not strong:
+            tried = f"（已试过：{'；'.join(notes[:3])}）" if notes else ""
+            return [], "", f"没找到匹配「{raw}」的人{tried}。可以让用户直接给 QQ 号。"
+
+        # 去重：同一个人可能在群成员和好友列表各命中一次，留分高的那条
+        best: dict[str, dict] = {}
+        for h in strong:
+            uid = str(h.get("user_id") or "")
+            if not uid:
+                continue
+            cur = best.get(uid)
+            if cur is None or h.get("score", 0) > cur.get("score", 0):
+                best[uid] = h
+        merged = sorted(
+            best.values(), key=lambda h: (-h.get("score", 0), h["user_id"])
+        )[: self._max_results()]
+        if len(merged) == 1:
+            self._person_cache_put(raw, merged[0])
+        return merged, "；".join(notes), ""
 
     async def _resolve_target(
         self, event: AstrMessageEvent, user: str, group_query: str = ""
